@@ -2,6 +2,7 @@
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const cors = require('cors');
@@ -18,8 +19,21 @@ function createSessionViaSDK(gameId) {
     const SDK_API_URL = process.env.SDK_API_URL;
     const SDK_API_KEY = process.env.SDK_API_KEY;
     
+    // Validate environment variables
+    if (!SDK_API_URL) {
+      reject(new Error('SDK_API_URL environment variable is not set'));
+      return;
+    }
+    if (!SDK_API_KEY) {
+      reject(new Error('SDK_API_KEY environment variable is not set'));
+      return;
+    }
+    
+    // Normalize SDK_API_URL to remove trailing slash to avoid double slashes
+    const normalizedApiUrl = SDK_API_URL.replace(/\/$/, '');
+    
     // Use correct endpoint path
-    const url = new URL(`${SDK_API_URL}/api/game/session/create`);
+    const url = new URL(`${normalizedApiUrl}/api/game/session/create`);
     url.searchParams.set('apiKey', SDK_API_KEY);
     
     // Server expects game_id as a number, but we're passing a string
@@ -39,9 +53,10 @@ function createSessionViaSDK(gameId) {
         'Content-Length': Buffer.byteLength(postData)
       }
     };
-    console.log('Options:', options);
     
-    const req = http.request(options, (res) => {
+    // Use https module for HTTPS URLs, http for HTTP URLs
+    const requestModule = url.protocol === 'https:' ? https : http;
+    const req = requestModule.request(options, (res) => {
       let data = '';
       
       res.on('data', (chunk) => {
@@ -49,9 +64,23 @@ function createSessionViaSDK(gameId) {
       });
       
       res.on('end', () => {
+        // Check if response is successful
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          console.error(`SDK API Error Response (${res.statusCode}):`, data.substring(0, 500));
+          reject(new Error(`SDK API returned status ${res.statusCode}: ${data.substring(0, 200)}`));
+          return;
+        }
+        
+        // Check if response is JSON
+        const contentType = res.headers['content-type'] || '';
+        if (!contentType.includes('application/json')) {
+          console.error('SDK API returned non-JSON response:', data.substring(0, 500));
+          reject(new Error(`SDK API returned non-JSON response (${contentType}). Response: ${data.substring(0, 200)}`));
+          return;
+        }
+        
         try {
           const response = JSON.parse(data);
-          console.log('Response:', response);
           // Server returns { success: true, data: { sessionId: ... } }
           if (response.success && response.data && response.data.sessionId) {
             resolve(response.data.sessionId);
@@ -60,7 +89,9 @@ function createSessionViaSDK(gameId) {
             reject(new Error(errorMsg));
           }
         } catch (err) {
-          reject(new Error('Invalid response from SDK API: ' + err.message));
+          console.error('Failed to parse SDK API response:', err.message);
+          console.error('Response body:', data.substring(0, 500));
+          reject(new Error('Invalid JSON response from SDK API: ' + err.message));
         }
       });
     });
@@ -79,7 +110,22 @@ function createSessionViaSDK(gameId) {
 
 // --- DB & Express Setup ---
 const app = express();
-app.use(cors());
+// Normalize CLIENT_URL to remove trailing slash for CORS
+const clientUrl = process.env.CLIENT_URL?.replace(/\/$/, '') || 'http://localhost:5173';
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    // Normalize origin by removing trailing slash
+    const normalizedOrigin = origin.replace(/\/$/, '');
+    if (normalizedOrigin === clientUrl) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
 app.use(express.json());
 
 mongoose
@@ -94,8 +140,19 @@ app.use('/api/auth', authRoutes);
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL,
+    origin: (origin, callback) => {
+      // Allow requests with no origin
+      if (!origin) return callback(null, true);
+      // Normalize origin by removing trailing slash
+      const normalizedOrigin = origin.replace(/\/$/, '');
+      if (normalizedOrigin === clientUrl) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
     methods: ['GET', 'POST'],
+    credentials: true,
   },
 });
 
@@ -208,7 +265,6 @@ async function endRound(roomId) {
         
         // Emit winner info with session ID for frontend to report to SDK
         if (game.sessionId) {
-          console.log(`Game winner: ${winnerUsername}, Session: ${game.sessionId}`);
           io.to(roomId).emit('game-over', { 
             winner: gameWinnerId,
             winnerUsername: winnerUsername,
@@ -257,11 +313,6 @@ io.use(async (socket, next) => {
 
 // --- Socket.io Connection Logic ---
 io.on('connection', (socket) => {
-  console.log(`\n=== User Connected ===`);
-  console.log(`Username: ${socket.user.username}`);
-  console.log(`User ID: ${socket.user._id}`);
-  console.log(`Socket ID: ${socket.id}`);
-  console.log(`Connection from: ${socket.handshake.address}`);
 
   // 1. Create Private Room
   socket.on('create-room', ({ sessionId }) => {
@@ -283,7 +334,6 @@ io.on('connection', (socket) => {
     };
     socket.join(roomId);
     socket.emit('room-created', { roomId, sessionId });
-    console.log(`Room created: ${roomId} by ${socket.user.username}, Session: ${sessionId}`);
   });
 
   // 2. Join Private Room
@@ -303,7 +353,6 @@ io.on('connection', (socket) => {
     // Check if user is already in the game
     const alreadyInGame = game.players.some(p => p.id === socket.user._id.toString());
     if (alreadyInGame) {
-      console.log(`${socket.user.username} already in game ${roomId}, just joining socket room`);
       socket.join(roomId);
       
       // Send current game state with sessionId
@@ -330,7 +379,6 @@ io.on('connection', (socket) => {
 
     // Prevent same user from joining as second player (if they're already the first player)
     if (game.players.length > 0 && game.players[0].id === socket.user._id.toString()) {
-      console.log(`${socket.user.username} tried to join their own room as second player`);
       socket.emit('error', { message: 'You cannot join your own room as a second player. Share the link with another user.' });
       return;
     }
@@ -342,8 +390,6 @@ io.on('connection', (socket) => {
       socketId: socket.id,
     });
     socket.join(roomId);
-
-    console.log(`${socket.user.username} joined room ${roomId}`);
 
     // Create game in DB
     try {
@@ -359,11 +405,6 @@ io.on('connection', (socket) => {
         username: p.username,
       }));
       
-      // Store session ID for later use (staking/winner reporting handled by SDK/frontend)
-      if (game.sessionId) {
-        console.log(`Game session ID: ${game.sessionId} for room ${roomId}`);
-      }
-      
       // Send game-start to each player individually with their own playerIndex
       // This ensures each client knows which player they are
       p1Socket.emit('game-start', { 
@@ -378,7 +419,6 @@ io.on('connection', (socket) => {
         myPlayerIndex: 1, // Player 2 is at index 1
         myUserId: p2Socket.user._id.toString()
       });
-      console.log(`Sent game-start to Player 1 (index 0) and Player 2 (index 1)`);
       startRound(roomId);
     } catch (err) {
       console.error('Error creating game:', err);
@@ -388,14 +428,9 @@ io.on('connection', (socket) => {
 
   // 3. Find Random Match
   socket.on('find-random-match', async () => {
-    console.log(`find-random-match request from ${socket.user.username} (${socket.user._id}) socket ${socket.id}`);
-    console.log(`Current queue size: ${matchingQueue.length}`);
-    console.log(`Queue users: ${matchingQueue.map(s => `${s.user.username}(${s.user._id})`).join(', ')}`);
-    
     // Check if already in queue by socket ID
     const alreadyInQueue = matchingQueue.some(s => s.id === socket.id);
     if (alreadyInQueue) {
-      console.log(`${socket.user.username} already in queue (by socket ID)`);
       socket.emit('error', { message: 'You are already in the matchmaking queue.' });
       return;
     }
@@ -403,15 +438,12 @@ io.on('connection', (socket) => {
     // Check if same user is already in queue (prevent same user from multiple tabs)
     const sameUserInQueue = matchingQueue.some(s => s.user._id.toString() === socket.user._id.toString());
     if (sameUserInQueue) {
-      console.log(`${socket.user.username} (${socket.user._id}) is already in queue from another tab/connection`);
-      console.log(`Existing socket in queue: ${matchingQueue.find(s => s.user._id.toString() === socket.user._id.toString())?.id}`);
       socket.emit('error', { message: 'You are already searching for a match in another tab. Please close that tab or wait for the match to complete.' });
       return;
     }
 
     // Add to queue (no sessionId yet - will be created when match is found)
     matchingQueue.push(socket);
-    console.log(`${socket.user.username} joined matchmaking queue. Queue size: ${matchingQueue.length}`);
 
     if (matchingQueue.length >= 2) {
       const p1Socket = matchingQueue.shift();
@@ -419,10 +451,6 @@ io.on('connection', (socket) => {
       
       // Prevent matching same user with themselves
       if (p1Socket.user._id.toString() === p2Socket.user._id.toString()) {
-        console.log(`\n❌ PREVENTED MATCHING SAME USER`);
-        console.log(`Player 1: ${p1Socket.user.username} (ID: ${p1Socket.user._id}, Socket: ${p1Socket.id})`);
-        console.log(`Player 2: ${p2Socket.user.username} (ID: ${p2Socket.user._id}, Socket: ${p2Socket.id})`);
-        console.log(`Both players have the same User ID - they are the same user account!`);
         // Put both back in queue (at front) and try to find different players
         matchingQueue.unshift(p2Socket, p1Socket);
         const errorMsg = 'Cannot match with yourself. Please use a different account (e.g., rahul vs rahul2), different browser, or incognito mode with a different account.';
@@ -431,27 +459,19 @@ io.on('connection', (socket) => {
         return;
       }
       
-      console.log(`\n✅ MATCHING DIFFERENT USERS`);
-      console.log(`Player 1: ${p1Socket.user.username} (ID: ${p1Socket.user._id}, Socket: ${p1Socket.id})`);
-      console.log(`Player 2: ${p2Socket.user.username} (ID: ${p2Socket.user._id}, Socket: ${p2Socket.id})`);
-      
       const roomId = uuidv4();
 
       // Create ONE shared session for the match via SDK API
       let gameSessionId = null;
       try {
         const gameId = process.env.GAME_ID || 1;
-        console.log(`Creating shared session via SDK API for match...`, gameId);
         gameSessionId = await createSessionViaSDK(gameId);
-        console.log(`✅ Shared session created for match: ${gameSessionId}`);
       } catch (err) {
-        console.error('❌ Failed to create session via SDK API:', err.message);
+        console.error('Failed to create session via SDK API:', err.message);
         p1Socket.emit('error', { message: 'Failed to create game session. Please try again.' });
         p2Socket.emit('error', { message: 'Failed to create game session. Please try again.' });
         return;
       }
-
-      console.log(`Matching ${p1Socket.user.username} vs ${p2Socket.user.username} in room ${roomId}, Shared Session: ${gameSessionId}`);
 
       try {
         const newGame = new Game({
@@ -491,21 +511,13 @@ io.on('connection', (socket) => {
           username: p.username,
         }));
 
-        // Store session ID for later use (staking/winner reporting handled by SDK/frontend)
-        if (gameSessionId) {
-          console.log(`Match session ID: ${gameSessionId} for room ${roomId}`);
-        }
-
         // Emit to each socket individually with roomId and sessionId
         p1Socket.emit('match-found', { roomId, players: clientPlayers, sessionId: gameSessionId });
         p2Socket.emit('match-found', { roomId, players: clientPlayers, sessionId: gameSessionId });
         
-        console.log(`Match found, sent to both players for room ${roomId}`);
-        
         // Start the game after a small delay to ensure clients have navigated
         // Send to each player individually with their playerIndex
         setTimeout(() => {
-          console.log(`Starting game in room ${roomId}`);
           p1Socket.emit('game-start', { 
             players: clientPlayers, 
             sessionId: gameSessionId,
@@ -518,7 +530,6 @@ io.on('connection', (socket) => {
             myPlayerIndex: 1,
             myUserId: p2Socket.user._id.toString()
           });
-          console.log(`Sent game-start individually to both players with correct indices`);
           startRound(roomId);
         }, 1000);
         
@@ -534,16 +545,12 @@ io.on('connection', (socket) => {
 
   // 4. Cancel Match Search
   socket.on('cancel-match-search', () => {
-    console.log(`${socket.user.username} (${socket.id}) cancelled match search`);
     const beforeLength = matchingQueue.length;
     matchingQueue = matchingQueue.filter((s) => s.id !== socket.id);
     const afterLength = matchingQueue.length;
     
     if (beforeLength !== afterLength) {
-      console.log(`Removed ${socket.user.username} from queue. Queue size: ${beforeLength} -> ${afterLength}`);
       socket.emit('match-search-cancelled');
-    } else {
-      console.log(`${socket.user.username} was not in queue`);
     }
   });
 
@@ -551,23 +558,19 @@ io.on('connection', (socket) => {
   socket.on('make-move', ({ roomId, move }) => {
     const game = games[roomId];
     if (!game) {
-      console.log(`Move attempted in non-existent room: ${roomId}`);
       return;
     }
 
     const playerIndex = game.players.findIndex((p) => p.socketId === socket.id);
     if (playerIndex === -1) {
-      console.log(`Player ${socket.user.username} not found in room ${roomId}`);
       return;
     }
 
     if (game.moves[playerIndex] !== null) {
-      console.log(`Player ${socket.user.username} already made a move`);
       return;
     }
 
     game.moves[playerIndex] = move;
-    console.log(`${socket.user.username} made move: ${move} in room ${roomId}`);
     socket.emit('move-confirmed');
 
     if (game.moves[0] && game.moves[1]) {
@@ -577,30 +580,14 @@ io.on('connection', (socket) => {
 
   // 6. Handle Disconnect
   socket.on('disconnect', () => {
-    console.log(`User disconnected: ${socket.user.username} (${socket.id})`);
-    
     // Remove from queue by socket ID
-    const beforeQueueLength = matchingQueue.length;
     matchingQueue = matchingQueue.filter((s) => s.id !== socket.id);
-    const afterQueueLength = matchingQueue.length;
-    
-    if (beforeQueueLength !== afterQueueLength) {
-      console.log(`Removed socket ${socket.id} from queue. Queue size: ${beforeQueueLength} -> ${afterQueueLength}`);
-    }
-    
-    // Also check if this user has other connections in queue (shouldn't happen, but just in case)
-    const userStillInQueue = matchingQueue.some(s => s.user._id.toString() === socket.user._id.toString());
-    if (userStillInQueue) {
-      console.warn(`User ${socket.user.username} still has another connection in queue`);
-    }
 
     for (const roomId in games) {
       const game = games[roomId];
       const playerIndex = game.players.findIndex((p) => p.socketId === socket.id);
 
       if (playerIndex !== -1) {
-        console.log(`Player ${socket.user.username} left game ${roomId}`);
-        
         const otherPlayerIndex = playerIndex === 0 ? 1 : 0;
         const otherPlayer = game.players[otherPlayerIndex];
         
