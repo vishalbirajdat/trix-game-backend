@@ -13,6 +13,7 @@ const Game = require('./models/Game');
 // Helper function to create session via SDK API
 function createSessionViaSDK(gameId) {
   return new Promise((resolve, reject) => {
+    try { 
     // Use the correct server URL and API key
     const SDK_API_URL = process.env.SDK_API_URL;
     const SDK_API_KEY = process.env.SDK_API_KEY;
@@ -24,7 +25,7 @@ function createSessionViaSDK(gameId) {
     // Server expects game_id as a number, but we're passing a string
     // For now, convert string gameId to a number (you may need to look up the actual game ID from DB)
     // TODO: Replace 'rock-paper-scissors' with actual numeric game_id from database
-    const numericGameId = typeof gameId === 'string' ? 1 : gameId; // Default to 1 for now
+    const numericGameId = typeof gameId === 'string' ? Number(gameId) : gameId; // Default to 1 for now
     
     const postData = JSON.stringify({ game_id: numericGameId });
     
@@ -38,6 +39,7 @@ function createSessionViaSDK(gameId) {
         'Content-Length': Buffer.byteLength(postData)
       }
     };
+    console.log('Options:', options);
     
     const req = http.request(options, (res) => {
       let data = '';
@@ -49,6 +51,7 @@ function createSessionViaSDK(gameId) {
       res.on('end', () => {
         try {
           const response = JSON.parse(data);
+          console.log('Response:', response);
           // Server returns { success: true, data: { sessionId: ... } }
           if (response.success && response.data && response.data.sessionId) {
             resolve(response.data.sessionId);
@@ -68,6 +71,9 @@ function createSessionViaSDK(gameId) {
     
     req.write(postData);
     req.end();
+  }catch(error){
+    console.error('Error creating session via SDK API:', error);
+  }
   });
 }
 
@@ -434,8 +440,8 @@ io.on('connection', (socket) => {
       // Create ONE shared session for the match via SDK API
       let gameSessionId = null;
       try {
-        const gameId = 'rock-paper-scissors';
-        console.log(`Creating shared session via SDK API for match...`);
+        const gameId = process.env.GAME_ID || 1;
+        console.log(`Creating shared session via SDK API for match...`, gameId);
         gameSessionId = await createSessionViaSDK(gameId);
         console.log(`✅ Shared session created for match: ${gameSessionId}`);
       } catch (err) {
